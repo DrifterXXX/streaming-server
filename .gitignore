@@ -1,0 +1,25 @@
+# 敏感凭证
+pan_creds.json
+*.secret.*
+.env
+
+# 日志
+server.log
+*.log
+
+# 缓存
+__pycache__/
+*.pyc
+.DS_Store
+._*
+
+# 视频文件（太大，不推送）
+videos/
+posters/
+data/
+
+# 下载队列
+download_queue.json
+
+# 浏览器缓存
+browser_cache/
