@@ -3,11 +3,14 @@
 流媒体服务器下载增强模块 — stream_server_v3.py 的下载功能扩展
 本地文件扫描 + yt-dlp 外部下载 + 批量下载 + 自动搜索下载源 + 增强管理 + 网盘下载
 """
-import os, json, time, re, threading, subprocess as sp
+import os, json, time, re, threading, subprocess as sp, fcntl
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import quote as url_quote, urlencode
 import urllib.request as urlreq
+from concurrent.futures import ThreadPoolExecutor
+import atexit
+import database
 
 # 网盘下载引擎
 try:
@@ -24,9 +27,73 @@ VIDEO_DIR = Path.home() / "services/streaming-server" / "videos"
 DB_FILE = Path.home() / "services/streaming-server" / "database.json"
 QUEUE_FILE = Path.home() / "services/streaming-server" / "download_queue.json"
 
-# Phase 1: 并发下载控制 — 最多3个同时进行
-MAX_CONCURRENT_DOWNLOADS = 3
-_download_semaphore = threading.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+# 下载工具路径自动解析
+def _find_executable(name, fallbacks=None):
+    """优先使用 shutil.which，再回退到常见安装路径"""
+    import shutil
+    path = shutil.which(name)
+    if path:
+        return path
+    if fallbacks:
+        for p in fallbacks:
+            if Path(p).exists():
+                return p
+    return name
+
+YT_DLP_BIN = _find_executable(
+    "yt-dlp",
+    fallbacks=[
+        str(Path.home() / "Library/Python/3.9/bin/yt-dlp"),
+        "/usr/local/bin/yt-dlp",
+        "/opt/homebrew/bin/yt-dlp",
+    ],
+)
+ARIA2C_BIN = _find_executable(
+    "aria2c",
+    fallbacks=["/opt/homebrew/bin/aria2c", "/usr/local/bin/aria2c"],
+)
+
+
+# BT公共Tracker列表 — 提高磁力链找到做种者的概率
+BT_TRACKERS = "&tr=" + "&tr=".join([
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://tracker.moeking.me:6969/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.cyberia.is:6969/announce",
+    "udp://tracker.dler.com:6969/announce",
+    "udp://tracker.tiny-vps.com:6969/announce",
+    "https://tracker.nanoha.org:443/announce",
+    "https://tr.anidl.org:443/announce",
+    "https://tracker.lilithraws.org:443/announce",
+    "wss://tracker.openwebtorrent.com:443/announce",
+])
+
+# aria2c基础参数模板
+ARIA2_BASE = [
+    "--seed-time=0",
+    "--enable-dht=true",
+    "--dht-listen-port=6881",
+    "--bt-require-crypto=true",
+    "--bt-max-peers=100",
+    "--max-connection-per-server=16",
+    "--split=16",
+    "--allow-overwrite=true",
+    "--async-dns=false",
+    "--user-agent=qBittorrent/4.6.5",
+]
+
+# 下载管理器线程锁
+_queue_lock = threading.Lock()
+
+# Phase 1: 并发下载控制 — 最多3个同时进行 (使用 stream_server_v3 的信号量)
+from stream_server_v3 import _download_semaphore
+
+# 并发下载执行器 (最多5个线程)
+_download_executor = ThreadPoolExecutor(max_workers=5)
+atexit.register(_download_executor.shutdown, wait=False)
 
 # 网盘分享链接正则 — 用于深度爬取资源页
 PAN_URL_PATTERNS = [
@@ -138,7 +205,13 @@ class YtDlpDownloader:
     
     def __init__(self, download_manager):
         self.dm = download_manager
-    
+
+    def _set_item(self, item, **kwargs):
+        """线程安全地更新 item 字典并保存队列"""
+        with self.dm._queue_lock:
+            item.update(kwargs)
+            self.dm._save_queue()
+
     def add_url_download(self, url, title=None, episode=None, season=None):
         """添加URL下载任务（支持B站/YouTube等）"""
         if not title:
@@ -169,29 +242,25 @@ class YtDlpDownloader:
     def execute_download(self, item):
         """实际执行 yt-dlp / aria2c 下载 — 带并发控制（最多3个）和失败重试"""
         # Phase 1: 并发控制
-        _download_semaphore.acquire()
+        acquired = _download_semaphore.acquire(timeout=120)
+        if not acquired:
+            self._set_item(item, status="failed", error="等待下载槽位超时（2分钟）")
+            return
         try:
             self._do_download(item)
             # Phase 1: 失败自动重试1次
             if item.get("status") == "failed" and not item.get("_retried"):
-                item["_retried"] = True
-                item["status"] = "retrying"
-                item["error"] = None
-                item["progress"] = 0
-                self.dm._save_queue()
+                self._set_item(item, _retried=True, status="retrying", error=None, progress=0)
                 self._do_download(item)
         except Exception as e:
-            item["status"] = "failed"
-            item["error"] = str(e)
-            self.dm._save_queue()
+            self._set_item(item, status="failed", error=str(e))
         finally:
-            _download_semaphore.release()
+            if acquired:
+                _download_semaphore.release()
 
     def _do_download(self, item):
         """下载核心逻辑（不含并发控制）"""
-        item["status"] = "downloading"
-        item["started_at"] = datetime.now().isoformat()
-        self.dm._save_queue()
+        self._set_item(item, status="downloading", started_at=datetime.now().isoformat())
         
         try:
             output_template = str(VIDEO_DIR / "%(title)s.%(ext)s")
@@ -218,17 +287,11 @@ class YtDlpDownloader:
                 )
                 
                 if result.get("success"):
-                    item["status"] = "done"
-                    item["progress"] = 100
-                    item["filepath"] = result.get("filepath")
-                    item["size_mb"] = result.get("size_mb", 0)
-                    self.dm._save_queue()
+                    self._set_item(item, status="completed", progress=100, filepath=result.get("filepath"), size_mb=result.get("size_mb", 0))
                     self.dm._scan_and_refresh()
                     return
-                
-                item["status"] = "error"
-                item["error"] = result.get("error", "夸克网盘下载失败")
-                self.dm._save_queue()
+
+                self._set_item(item, status="failed", error=result.get("error", "夸克网盘下载失败"))
                 return
             
             # ── 阿里云盘 ──
@@ -244,17 +307,11 @@ class YtDlpDownloader:
                 )
                 
                 if result.get("success"):
-                    item["status"] = "done"
-                    item["progress"] = 100
-                    item["filepath"] = result.get("filepath")
-                    item["size_mb"] = result.get("size_mb", 0)
-                    self.dm._save_queue()
+                    self._set_item(item, status="completed", progress=100, filepath=result.get("filepath"), size_mb=result.get("size_mb", 0))
                     self.dm._scan_and_refresh()
                     return
-                
-                item["status"] = "error"
-                item["error"] = result.get("error", "阿里云盘下载失败")
-                self.dm._save_queue()
+
+                self._set_item(item, status="failed", error=result.get("error", "阿里云盘下载失败"))
                 return
             
             # ── 百度网盘 ──
@@ -270,17 +327,11 @@ class YtDlpDownloader:
                 )
                 
                 if result.get("success"):
-                    item["status"] = "done"
-                    item["progress"] = 100
-                    item["filepath"] = result.get("filepath")
-                    item["size_mb"] = result.get("size_mb", 0)
-                    self.dm._save_queue()
+                    self._set_item(item, status="completed", progress=100, filepath=result.get("filepath"), size_mb=result.get("size_mb", 0))
                     self.dm._scan_and_refresh()
                     return
-                
-                item["status"] = "error"
-                item["error"] = result.get("error", "百度网盘下载失败")
-                self.dm._save_queue()
+
+                self._set_item(item, status="failed", error=result.get("error", "百度网盘下载失败"))
                 return
             
             if is_magnet:
@@ -301,7 +352,7 @@ class YtDlpDownloader:
                 ]
             else:
                 # 流媒体用 yt-dlp（带分集支持）
-                cmd = ["/Users/ayong/Library/Python/3.9/bin/yt-dlp", "-o", output_template]
+                cmd = [YT_DLP_BIN, "-o", output_template]
                 episode = item.get("episode")
                 if episode is not None and isinstance(episode, int):
                     cmd += ["--playlist-start", str(episode), "--playlist-end", str(episode)]
@@ -318,17 +369,26 @@ class YtDlpDownloader:
             else:
                 env["PATH"] = extra_paths
             
-            process = sp.Popen(
-                cmd,
-                stdout=sp.PIPE,
-                stderr=sp.STDOUT,
-                text=True,
-                bufsize=0,  # 无缓冲（aria2c用\r输出进度）
-                env=env
-            )
+            if is_magnet:
+                process = sp.Popen(
+                    cmd,
+                    stdout=sp.DEVNULL,
+                    stderr=sp.DEVNULL,
+                    env=env
+                )
+            else:
+                process = sp.Popen(
+                    cmd,
+                    stdout=sp.PIPE,
+                    stderr=sp.STDOUT,
+                    text=True,
+                    bufsize=0,  # 无缓冲（aria2c用\\r输出进度）
+                    env=env
+                )
             
             # 注册到下载管理器，供cancel/remove杀进程
-            self.dm.active_downloads[item["id"]] = process
+            with self.dm._queue_lock:
+                self.dm.active_downloads[item["id"]] = process
             
             start_time = time.time()
             last_check = time.time()
@@ -356,20 +416,17 @@ class YtDlpDownloader:
                             estimated = max(2000, size_mb * 3)
                             progress = min(99, int(size_mb / estimated * 100))
                             
-                            item["progress"] = max(item["progress"], progress)
-                            item["speed"] = f"{speed:.2f} MB/s"
-                            item["error"] = None  # 清除之前的连接提示
+                            self._set_item(item, progress=max(item.get("progress", 0), progress), speed=f"{speed:.2f} MB/s", error=None)
                         else:
                             # 还没连上，显示等待时间
                             if elapsed_wait < 30:
-                                item["speed"] = "连接DHT..."
+                                speed_text = "连接DHT..."
                             elif elapsed_wait < 120:
-                                item["speed"] = f"等待节点 ({elapsed_wait:.0f}s)"
+                                speed_text = f"等待节点 ({elapsed_wait:.0f}s)"
                             else:
-                                item["speed"] = f"搜索中 ({elapsed_wait:.0f}s)"
-                            item["progress"] = 3
+                                speed_text = f"搜索中 ({elapsed_wait:.0f}s)"
+                            self._set_item(item, speed=speed_text, progress=3)
                         
-                        self.dm._save_queue()
                         last_check = now
                     
                     if ret is not None:
@@ -383,15 +440,22 @@ class YtDlpDownloader:
                 # ── yt-dlp：标准输出解析 ──
                 for line in process.stdout:
                     elapsed = time.time() - start_time
+                    if elapsed > max_wait:
+                        process.kill()
+                        self._set_item(item, status="failed", error="下载超时（10分钟）")
+                        break
                     if time.time() - last_check > 1:
-                        item["progress"] = min(99, int(elapsed * 2))
-                        item["speed"] = f"{elapsed:.1f}s"
-                        self.dm._save_queue()
+                        self._set_item(item, progress=min(99, int(elapsed * 2)), speed=f"{elapsed:.1f}s")
                         last_check = time.time()
-                process.wait()
+                try:
+                    process.wait(timeout=10)
+                except sp.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
             
             # 清理进程记录
-            self.dm.active_downloads.pop(item["id"], None)
+            with self.dm._queue_lock:
+                self.dm.active_downloads.pop(item["id"], None)
             elapsed = time.time() - start_time
             
             # ── 查找下载完成的文件 ──
@@ -408,16 +472,9 @@ class YtDlpDownloader:
                 
                 if expected_files:
                     newest = max(expected_files, key=lambda f: f.stat().st_size)
-                    item["status"] = "completed"
-                    item["completed_at"] = datetime.now().isoformat()
-                    item["filename"] = newest.name
-                    item["size"] = newest.stat().st_size
-                    item["size_mb"] = round(newest.stat().st_size / 1024 / 1024, 1)
-                    item["progress"] = 100
-                    item["speed"] = f"耗时{elapsed:.0f}s"
+                    self._set_item(item, status="completed", completed_at=datetime.now().isoformat(), filename=newest.name, size=newest.stat().st_size, size_mb=round(newest.stat().st_size / 1024 / 1024, 1), progress=100, speed=f"耗时{elapsed:.0f}s")
                 else:
-                    item["status"] = "failed"
-                    item["error"] = f"无做种或下载超时（{elapsed:.0f}s）"
+                    self._set_item(item, status="failed", error=f"无做种或下载超时（{elapsed:.0f}s）")
             else:
                 # yt-dlp: scan for any new video file
                 downloaded_files = list(VIDEO_DIR.glob("*"))
@@ -426,21 +483,15 @@ class YtDlpDownloader:
                            and f.suffix.lower() in ('.mp4', '.mkv', '.webm')]
                 if new_files:
                     newest = max(new_files, key=lambda f: f.stat().st_mtime)
-                    item["status"] = "completed"
-                    item["completed_at"] = datetime.now().isoformat()
-                    item["filename"] = newest.name
-                    item["size"] = newest.stat().st_size
-                    item["size_mb"] = round(newest.stat().st_size / 1024 / 1024, 1)
-                    item["progress"] = 100
+                    self._set_item(item, status="completed", completed_at=datetime.now().isoformat(), filename=newest.name, size=newest.stat().st_size, size_mb=round(newest.stat().st_size / 1024 / 1024, 1), progress=100)
                 else:
-                    item["status"] = "failed"
-                    item["error"] = "下载完成但未找到视频文件，链接可能无效或格式不支持"
-        
+                    self._set_item(item, status="failed", error="下载完成但未找到视频文件，链接可能无效或格式不支持")
+
         except Exception as e:
-            self.dm.active_downloads.pop(item["id"], None)
-            item["status"] = "failed"
-            item["error"] = str(e)
-        
+            with self.dm._queue_lock:
+                self.dm.active_downloads.pop(item["id"], None)
+            self._set_item(item, status="failed", error=str(e))
+
         self.dm._save_queue()
 
 
@@ -478,8 +529,8 @@ def get_database():
         try:
             with open(DB_FILE, encoding='utf-8') as f:
                 return json.load(f)
-        except:
-            pass
+        except Exception as e:
+            print(f"[get_database] error: {e}")
     return {"movies": [], "last_updated": ""}
 
 
@@ -496,8 +547,26 @@ def update_download_urls(media_id, urls):
 
 # ─── 自动搜索下载源（仅网盘） ─────────────────────────
 
+def _curl_fetch(url, timeout=12):
+    """用 curl 替代 urllib 获取网页内容（系统 Python 的 LibreSSL 太旧，无法连大部分 HTTPS）"""
+    try:
+        proc = sp.run(
+            ["curl", "-sL", "--max-time", str(timeout),
+             "-H", "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+             "-H", "Accept-Language: zh-CN,zh;q=0.9",
+             url],
+            capture_output=True, text=True, timeout=timeout+5,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            return proc.stdout
+        return ""
+    except Exception as ex:
+        print(f"[_curl_fetch] error for {url[:80]}: {ex}")
+        return ""
+
+
 def auto_search_sources(title, year=None, media_type="电影", max_results=15):
-    """自动搜索网盘下载源 — 深度爬取资源页提取网盘分享链接"""
+    """自动搜索网盘下载源 — 深度爬取资源页提取网盘分享链接（使用 curl 而非 urllib）"""
     results = []
     dedup = set()
 
@@ -515,63 +584,61 @@ def auto_search_sources(title, year=None, media_type="电影", max_results=15):
     def extract_pan_from_page(page_url):
         """访问页面提取网盘分享链接"""
         found = []
-        try:
-            req = urlreq.Request(page_url, headers={
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                "Accept": "text/html,application/xhtml+xml",
-            })
-            with urlreq.urlopen(req, timeout=10) as resp:
-                html = resp.read().decode('utf-8', errors='replace')
+        html = _curl_fetch(page_url, timeout=10)
+        if not html:
+            return found
 
-                # 提取网盘分享链接
-                for pattern, pan_name in PAN_URL_PATTERNS:
-                    for m in re.finditer(pattern, html, re.I):
-                        url = m.group(1)
-                        if url not in dedup:
-                            dedup.add(url)
-                            # 尝试提取密码
-                            pwd = None
-                            pwd_match = re.search(r'(?:pwd|密码|提取码)[=：:\s]*([a-zA-Z0-9]{4,6})', html[max(0, m.end()-200):m.end()+200])
-                            if pwd_match:
-                                pwd = pwd_match.group(1)
-                                url = f"{url}?pwd={pwd}" if '?' not in url else f"{url}&pwd={pwd}"
+        # 提取网盘分享链接
+        for pattern, pan_name in PAN_URL_PATTERNS:
+            for m in re.finditer(pattern, html, re.I):
+                url = m.group(1)
+                if url not in dedup:
+                    dedup.add(url)
+                    # 尝试提取密码
+                    pwd = None
+                    pwd_match = re.search(r'(?:pwd|密码|提取码)[=：:\s]*([a-zA-Z0-9]{4,6})', html[max(0, m.end()-200):m.end()+200])
+                    if pwd_match:
+                        pwd = pwd_match.group(1)
+                        # 避免已有 pwd 参数时重复追加
+                        if '?pwd=' in url or '&pwd=' in url:
+                            if pwd not in url:
+                                url = f"{url}&pwd={pwd}"
+                        else:
+                            url = f"{url}?pwd={pwd}"
 
-                            found.append({
-                                "url": url,
-                                "title": f"{pan_name}: {title}",
-                                "source": pan_name,
-                                "_pan": pan_name,
-                                "_pan_key": PAN_NAME_TO_KEY.get(pan_name, ""),
-                                "_pwd": pwd,
-                            })
+                    found.append({
+                        "url": url,
+                        "title": f"{pan_name}: {title}",
+                        "source": pan_name,
+                        "_pan": pan_name,
+                        "_pan_key": PAN_NAME_TO_KEY.get(pan_name, ""),
+                        "_pwd": pwd,
+                    })
 
-                # 也提取页面中的提取码（与最近一个网盘链接关联）
-                # 有些页面用 "密码：xxxx" 格式
-                pwd_matches = re.finditer(r'(?:密码|提取码|验证码)[：:]\s*([a-zA-Z0-9]{4,6})', html)
-                for pm in pwd_matches:
-                    # 查找这个密码附近是否有网盘链接
-                    pos = pm.start()
-                    nearby_html = html[max(0, pos-500):pos+100]
-                    for pattern, pan_name in PAN_URL_PATTERNS:
-                        url_match = re.search(pattern, nearby_html, re.I)
-                        if url_match:
-                            url = url_match.group(1)
-                            if url not in dedup:
-                                dedup.add(url)
-                                found.append({
-                                    "url": url + "?pwd=" + pm.group(1),
-                                    "title": f"{pan_name}: {title}",
-                                    "source": pan_name,
-                                    "_pan": pan_name,
-                                    "_pan_key": PAN_NAME_TO_KEY.get(pan_name, ""),
-                                    "_pwd": pm.group(1),
-                                })
-        except:
-            pass
+        # 也提取页面中的提取码（与最近一个网盘链接关联）
+        # 有些页面用 "密码：xxxx" 格式
+        pwd_matches = re.finditer(r'(?:密码|提取码|验证码)[：:]\s*([a-zA-Z0-9]{4,6})', html)
+        for pm in pwd_matches:
+            # 查找这个密码附近是否有网盘链接
+            pos = pm.start()
+            nearby_html = html[max(0, pos-500):pos+100]
+            for pattern, pan_name in PAN_URL_PATTERNS:
+                url_match = re.search(pattern, nearby_html, re.I)
+                if url_match:
+                    url = url_match.group(1)
+                    if url not in dedup:
+                        dedup.add(url)
+                        found.append({
+                            "url": url + "?pwd=" + pm.group(1),
+                            "title": f"{pan_name}: {title}",
+                            "source": pan_name,
+                            "_pan": pan_name,
+                            "_pan_key": PAN_NAME_TO_KEY.get(pan_name, ""),
+                            "_pwd": pm.group(1),
+                        })
         return found
 
-    # DuckDuckGo 搜索
-    from urllib.parse import urlencode as ue
+    # Bing 搜索（替代被墙的 DuckDuckGo，使用 curl 绕过系统 Python SSL 问题）
     pan_found_count = 0
     for term in search_terms:
         if pan_found_count >= 8:
@@ -586,56 +653,86 @@ def auto_search_sources(title, year=None, media_type="电影", max_results=15):
                 break
 
         try:
-            ddg_url = f"https://html.duckduckgo.com/html/?q={ue({'q': term}).replace('q=', '')}"
-            req = urlreq.Request(ddg_url, headers={
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                "Accept": "text/html,application/xhtml+xml",
-            })
-            with urlreq.urlopen(req, timeout=12) as resp:
-                html = resp.read().decode('utf-8', errors='replace')
-                if 'result__a' not in html:
+            from urllib.parse import urlencode
+            bing_url = f"https://www.bing.com/search?{urlencode({'q': term, 'cc': 'cn', 'setlang': 'zh-cn'})}"
+            html = _curl_fetch(bing_url, timeout=12)
+            if not html or len(html) < 5000:
+                continue
+
+            # Bing 结果解析：li.b_algo > h2 > a
+            for block in re.finditer(r'<li class="b_algo[^"]*".*?</li>', html, re.I | re.S):
+                a_href = re.search(r'href="(https?://[^"]+)"', block.group())
+                h2_text = re.search(r'<h2[^>]*>(.*?)</h2>', block.group(), re.S)
+                if not (a_href and h2_text):
+                    continue
+                url = a_href.group(1)
+                text = re.sub(r'<[^>]+>', '', h2_text.group(1)).strip()
+                if not text:
                     continue
 
-                for match in re.finditer(r'class="result__a"[^>]*href="([^"]+)"[^>]*>([^<]*)</a>', html, re.I):
-                    url = match.group(1)
-                    if 'duckduckgo.com/l/?uddg=' in url:
-                        from urllib.parse import unquote
-                        url = unquote(url.split('uddg=')[1].split('&')[0])
-                    text = match.group(2).strip()
-                    if url in dedup:
-                        continue
-                    dedup.add(url)
+                # 跳过 Bing 自己的链接
+                if 'r.bing.com' in url or 'bing.com' in url:
+                    continue
 
-                    # 检查这个 URL 是否本身就是网盘链接
-                    is_pan_directly = False
-                    for pattern, pan_name in PAN_URL_PATTERNS:
-                        m = re.search(pattern, url, re.I)
-                        if m:
-                            pan_url = m.group(1)
+                if url in dedup:
+                    continue
+                dedup.add(url)
+
+                # 检查这个 URL 是否本身就是网盘链接
+                is_pan_directly = False
+                for pattern, pan_name in PAN_URL_PATTERNS:
+                    m = re.search(pattern, url, re.I)
+                    if m:
+                        pan_url = m.group(1)
+                        found_item = {
+                            "url": pan_url,
+                            "title": f"{pan_name}: {title}",
+                            "source": pan_name,
+                            "_pan": pan_name,
+                            "_pan_key": PAN_NAME_TO_KEY.get(pan_name, ""),
+                        }
+                        results.append(found_item)
+                        pan_found_count += 1
+                        is_pan_directly = True
+                        break
+
+                if is_pan_directly:
+                    continue
+
+                # 检查是否是资源页（包含网盘关键词）
+                is_resource_page = any(k in (text + url) for k in ['网盘', '百度网盘', '阿里云盘', '夸克', '天翼云', '迅雷云', 'pan.baidu', 'aliyundrive', 'alipan', 'quark.cn', 'cloud.189', 'pan.xunlei'])
+
+                if is_resource_page:
+                    # 深度爬取资源页
+                    deep = extract_pan_from_page(url)
+                    results.extend(deep)
+                    pan_found_count += len(deep)
+
+            # 也直接提取整个页面中的网盘链接（Bing 搜索结果页可能有直链）
+            if pan_found_count < 3:
+                for pattern, pan_name in PAN_URL_PATTERNS:
+                    for m in re.finditer(pattern, html, re.I):
+                        pan_url = m.group(1)
+                        if pan_url not in dedup:
+                            dedup.add(pan_url)
+                            # 尝试提取密码
+                            pwd = None
+                            pwd_match = re.search(r'(?:pwd|密码|提取码)[=：:\s]*([a-zA-Z0-9]{4,6})', html[max(0, m.end()-200):m.end()+200])
+                            if pwd_match:
+                                pwd = pwd_match.group(1)
+                                pan_url = f"{pan_url}?pwd={pwd}" if '?' not in pan_url else f"{pan_url}&pwd={pwd}"
                             found_item = {
                                 "url": pan_url,
                                 "title": f"{pan_name}: {title}",
                                 "source": pan_name,
                                 "_pan": pan_name,
                                 "_pan_key": PAN_NAME_TO_KEY.get(pan_name, ""),
+                                "_pwd": pwd,
                             }
                             results.append(found_item)
                             pan_found_count += 1
-                            is_pan_directly = True
-                            break
-
-                    if is_pan_directly:
-                        continue
-
-                    # 检查是否是资源页（包含网盘关键词）
-                    is_resource_page = any(k in (text + url) for k in ['网盘', '百度网盘', '阿里云盘', '夸克', '天翼云', '迅雷云', 'pan.baidu', 'aliyundrive', 'alipan', 'quark.cn', 'cloud.189', 'pan.xunlei'])
-
-                    if is_resource_page:
-                        # 深度爬取资源页
-                        deep = extract_pan_from_page(url)
-                        results.extend(deep)
-                        pan_found_count += len(deep)
-        except:
+        except Exception as ex:
+            print(f"[auto_search_sources] bing search '{term}' failed: {ex}")
             continue
 
     # 按网盘类型排序：已登录的可自动下载的排前面
@@ -710,7 +807,7 @@ def test_source_availability(source):
         # ── YouTube / 解说类 ──
         elif 'youtube.com' in url or 'youtu.be' in url:
             proc = sp.run(
-                ["/Users/ayong/Library/Python/3.9/bin/yt-dlp", "--no-download",
+                [YT_DLP_BIN, "--no-download",
                  "--print", "duration", url],
                 capture_output=True, text=True, timeout=15
             )
@@ -734,7 +831,7 @@ def test_source_availability(source):
         # ── 流媒体（腾讯/爱奇艺/优酷/B站） ──
         elif any(d in url for d in ['v.qq.com', 'iqiyi.com', 'youku.com', 'mgtv.com']):
             proc = sp.run(
-                ["/Users/ayong/Library/Python/3.9/bin/yt-dlp", "--no-download",
+                [YT_DLP_BIN, "--no-download",
                  "--print", "duration", url],
                 capture_output=True, text=True, timeout=15
             )
@@ -762,7 +859,7 @@ def test_source_availability(source):
         # ── B站 ──
         elif 'bilibili.com' in url:
             proc = sp.run(
-                ["/Users/ayong/Library/Python/3.9/bin/yt-dlp", "--no-download",
+                [YT_DLP_BIN, "--no-download",
                  "--print", "duration", url],
                 capture_output=True, text=True, timeout=15
             )
@@ -866,19 +963,94 @@ def test_all_sources(sources):
     unavailable = [s for s in tested if not s.get("available")]
     
     # 可用源按速度排序（快在前）
-    available.sort(key=lambda s: s.get("speed_ms", 99999))
+    available.sort(key=lambda s: s.get("speed_ms") or 99999)
     
     # 不可用源排在最后，也按速度排
-    unavailable.sort(key=lambda s: s.get("speed_ms", 99999))
+    unavailable.sort(key=lambda s: s.get("speed_ms") or 99999)
     
     return available + unavailable
 
 
+import uuid as _uuid
+
+AUTO_FIND_RESULTS = {}
+
+
+def _auto_find_set_result(job_id, data):
+    AUTO_FIND_RESULTS[job_id] = {"status": "done", "data": data}
+
+
+def _auto_find_set_error(job_id, error):
+    AUTO_FIND_RESULTS[job_id] = {"status": "error", "error": str(error)}
+
+
+import uuid as _uuid
+
+AUTO_FIND_RESULTS = {}
+MAX_AUTO_FIND_AGE_SECONDS = 30 * 60
+
+
+def _auto_find_set_result(job_id, data):
+    AUTO_FIND_RESULTS[job_id] = {"status": "done", "data": data}
+
+
+def _auto_find_set_error(job_id, error):
+    AUTO_FIND_RESULTS[job_id] = {"status": "error", "error": str(error)}
+
+
+def start_auto_search_task(media_id, media):
+    job_id = _uuid.uuid4().hex
+    AUTO_FIND_RESULTS[job_id] = {"status": "processing", "media_id": media_id}
+
+    def task():
+        try:
+            title = media.get("title", "")
+            year = media.get("year", "")
+            mtype = media.get("type", "电影")
+            episodes = media.get("episodes", 0)
+
+            sources = auto_search_sources(title, year, mtype)
+            if not sources:
+                _auto_find_set_result(
+                    job_id,
+                    {
+                        "success": False,
+                        "error": "未找到任何下载源",
+                        "manual": True,
+                        "job_id": job_id,
+                    },
+                )
+                return
+
+            tested = test_all_sources(sources)
+            _auto_find_set_result(
+                job_id,
+                {
+                    "success": True,
+                    "job_id": job_id,
+                    "media_id": media_id,
+                    "sources": tested,
+                    "is_series": mtype == "电视剧",
+                    "episodes": episodes,
+                },
+            )
+        except Exception as e:
+            _auto_find_set_error(job_id, e)
+
+    t = threading.Thread(target=task, daemon=True)
+    t.start()
+    return job_id
+
+
+def get_auto_find_result(job_id):
+    return AUTO_FIND_RESULTS.get(job_id)
+
+
 def handle_auto_download(server, query, download_manager):
-    """处理 /api/auto-download — 一劳永逸：自动搜源 → 测速 → 选最快 → 开下"""
+    """处理 /api/auto-download — 异步提交后立即返回 job_id"""
     media_id = query.get("id", "")
     if not media_id:
-        server.send_json({"success": False, "error": "缺少媒体ID"}, 400)
+        server.send_json({"success": False, "error": "缺少媒体ID", "job_id": None}, 400)
         return
 
     db = get_database()
@@ -889,283 +1061,76 @@ def handle_auto_download(server, query, download_manager):
             break
 
     if not media:
-        server.send_json({"success": False, "error": "未找到该媒体"}, 404)
+        server.send_json({"success": False, "error": "未找到该媒体", "job_id": None}, 404)
         return
 
-    title = media.get("title", "")
-    year = media.get("year", "")
-    mtype = media.get("type", "电影")
-    is_series = mtype == "电视剧"
-    episodes = media.get("episodes", 0)
-
-    # 1. 自动搜索源
-    sources = auto_search_sources(title, year, mtype)
-
-    if not sources:
-        server.send_json({"success": False, "error": "未找到任何下载源", "manual": True}, 404)
+    try:
+        job_id = start_auto_search_task(media_id, media)
+    except Exception as e:
+        server.send_json({"success": False, "error": str(e), "job_id": None}, 500)
         return
 
-    # 2. 测速（最多等20秒）
-    tested = []
-    def run_tests():
-        nonlocal tested
-        tested = test_all_sources(sources)
-
-    t = threading.Thread(target=run_tests, daemon=True)
-    t.start()
-    t.join(timeout=20)
-
-    if t.is_alive():
-        # 超时了，选磁链优先（有做种可能）或第一个源
-        for s in sources:
-            url = s.get("url", "")
-            s["available"] = url.startswith("magnet:")  # 磁链赌一把
-        tested = sources
-
-    # 3. 选最佳可用源
-    available = [s for s in tested if s.get("available")]
-    if is_series and episodes > 0:
-        # 电视剧：返回批量下载入口，不直接下（集数太多）
-        server.send_json({
+    server.send_json(
+        {
             "success": True,
-            "is_series": True,
-            "title": title,
-            "episodes": episodes,
-            "best_source": available[0] if available else tested[0],
-            "message": f"电视剧 {title} 共{episodes}集, 自动搜到{len(available)}个可用源, 请从下载管理批量添加"
-        })
-        return
-
-    if not available:
-        # 无可用源但可能有磁链/网盘能试
-        first = tested[0] if tested else None
-        if first and (first.get("url", "").startswith("magnet:") or first.get("manual_open")):
-            # 磁链或手动链接，直接试
-            dl = YtDlpDownloader(download_manager)
-            item_id = dl.add_url_download(first.get("url", ""), title=title)
-            item = next((i for i in download_manager.queue if i["id"] == item_id), None)
-            if item:
-                t = threading.Thread(target=dl.execute_download, args=(item,), daemon=True)
-                t.start()
-            server.send_json({
-                "success": True,
-                "id": item_id,
-                "title": title,
-                "source": first.get("url", "")[:60],
-                "message": "未找到最快源，已尝试最佳候选"
-            })
-            return
-        server.send_json({"success": False, "error": "所有源均不可用", "manual": True})
-        return
-
-    # 4. 选最快源开下
-    best = available[0]  # test_all_sources已按速度排序，最快在前
-    best_url = best.get("url", "")
-    best_title = best.get("title", title)
-
-    dl = YtDlpDownloader(download_manager)
-    item_id = dl.add_url_download(best_url, title=best_title)
-    item = next((i for i in download_manager.queue if i["id"] == item_id), None)
-    if item:
-        t = threading.Thread(target=dl.execute_download, args=(item,), daemon=True)
-        t.start()
-
-    # 5. 同时返回其余可用源做备用
-    server.send_json({
-        "success": True,
-        "id": item_id,
-        "title": best_title,
-        "source": best_url[:80],
-        "type_label": best.get("type_label", ""),
-        "total_sources": len(available),
-        "backup_sources": [{"url": s.get("url","")[:80], "label": s.get("label","")} for s in available[1:4]],
-        "message": f"已从{len(available)}个可用源中选中最快源开始下载"
-    })
+            "job_id": job_id,
+            "media_id": media_id,
+            "message": "搜索任务已提交，请通过 /api/auto-result 轮询结果",
+        }
+    )
 
 
 def handle_auto_find(server, query, download_manager):
-    """处理 /api/auto-find 请求 — 自动搜索下载源"""
+    """处理 /api/auto-find — 异步提交后立即返回 job_id"""
     media_id = query.get("id", "")
     if not media_id:
-        server.send_json({"success": False, "error": "缺少媒体ID"}, 400)
+        server.send_json({"success": False, "error": "缺少媒体ID", "job_id": None}, 400)
         return
-    
+
     db = get_database()
     media = None
     for m in db.get("movies", []):
         if m.get("id") == media_id:
             media = m
             break
-    
+
     if not media:
-        server.send_json({"success": False, "error": "未找到该媒体"}, 404)
+        server.send_json({"success": False, "error": "未找到该媒体", "job_id": None}, 404)
         return
-    
-    title = media.get("title", "")
-    year = media.get("year", "")
-    mtype = media.get("type", "电影")
-    
-    sources = auto_search_sources(title, year, mtype)
-    
-    manual_count = 0
-    # 后台线程跑可用性检测，设总超时防止阻塞服务器
-    tested = []
-    def run_tests():
-        nonlocal tested
-        tested = test_all_sources(sources)
-    
-    t = threading.Thread(target=run_tests, daemon=True)
-    t.start()
-    t.join(timeout=15)  # 最多等15秒（Phase 1.2: 从25s缩短到15s）
-    
-    if t.is_alive():
-        # 超时了，用搜索结果直接展示（不做测试）
-        for s in sources:
-            url = s.get("url", "")
-            if url.startswith("magnet:"):
-                s["available"] = True
-                s["speed_badge"] = "⏱超时"
-                s["label"] = "做种未知（测试超时）"
-                s["type_label"] = "磁力链接"
-                s["type_icon"] = "🔗"
-            elif 'youtube.com' in url:
-                s["available"] = False
-                s["speed_badge"] = "⏱超时"
-                s["label"] = "跳过测试"
-                s["type_label"] = "YouTube"
-                s["type_icon"] = "🎬"
-                s["test_error"] = "测试超时"
-            elif any(pan in url for pan in ['pan.baidu.com', 'aliyundrive.com', 'alipan.com',
-                'quark.cn', '115.com', 'cloud.189.cn', 'pan.xunlei.com', '123pan.com', 'lanzou']):
-                pan_name = next((n for p, n in [('pan.baidu.com','百度网盘'),('aliyundrive.com','阿里云盘'),
-                    ('alipan.com','阿里云盘'),('quark.cn','夸克网盘'),('115.com','115网盘'),
-                    ('cloud.189.cn','天翼云盘'),('pan.xunlei.com','迅雷云盘'),('123pan.com','123云盘'),
-                    ('lanzou','蓝奏云')] if p in url), '网盘')
-                s["available"] = False
-                s["manual_open"] = True
-                s["speed_badge"] = "⏱超时"
-                s["type_label"] = pan_name
-                s["type_icon"] = "☁️"
-                s["test_error"] = "需手动下载"
-            else:
-                s["available"] = False
-                s["manual_open"] = True
-                s["speed_badge"] = "⏱超时"
-                s["type_label"] = "资源页"
-                s["type_icon"] = "📄"
-                s["test_error"] = "测试超时"
-                # 携带搜索上下文中的网盘信息
-                if s.get("_search_pan"):
-                    s["_page_pan"] = s["_search_pan"]
-        filtered = sources
-        avail_count = len([s for s in filtered if s.get("available")])
-        page_hint = "⏱ 可用性测试超时（15s），部分源未检测"
-    else:
-        # 正常检测完成
-        filtered = []
-        page_warnings = []
-        for s in tested:
-            url = s.get("url", "")
-            label = s.get("label", "")
-            avail = s.get("available", False)
-            speed = s.get("speed_ms")
-            dur = s.get("duration_m")
-            error = s.get("test_error")
-            
-            if url.startswith("magnet:"):
-                s["type_label"] = "磁力链接"
-                s["type_icon"] = "🔗"
-                s["hint"] = label
-            elif any(u in url for u in ['.mp4', '.mkv', '.avi', '.ts', '.webm']) and '://' in url:
-                s["type_label"] = "直链"
-                s["type_icon"] = "📥"
-                s["hint"] = label
-            elif 'youtube.com' in url or 'youtu.be' in url:
-                s["type_label"] = "YouTube"
-                s["type_icon"] = "🎬"
-                s["hint"] = label or "解说/预告片"
-            elif 'bilibili.com' in url:
-                s["type_label"] = "B站"
-                s["type_icon"] = "📺"
-                s["hint"] = label or "预览"
-            elif any(d in url for d in ['v.qq.com', 'iqiyi.com', 'youku.com', 'mgtv.com']):
-                s["type_label"] = "流媒体"
-                s["type_icon"] = "📺"
-                s["hint"] = label or "预告/需会员"
-            elif s.get("_pan") or any(pan in url for pan in ['pan.baidu.com', 'aliyundrive.com',
-                'alipan.com', 'quark.cn', '115.com', 'cloud.189.cn',
-                'pan.xunlei.com', '123pan.com', 'lanzou']):
-                pan_name = s.get("_pan", "")
-                if not pan_name:
-                    for p, n in [('pan.baidu.com','百度网盘'),('aliyundrive.com','阿里云盘'),
-                                 ('alipan.com','阿里云盘'),('quark.cn','夸克网盘'),
-                                 ('115.com','115网盘'),('cloud.189.cn','天翼云盘'),
-                                 ('pan.xunlei.com','迅雷云盘'),('123pan.com','123云盘'),
-                                 ('lanzou','蓝奏云')]:
-                        if p in url: pan_name = n; break
-                s["type_label"] = f"{pan_name}"
-                s["type_icon"] = "☁️"
-                s["manual_open"] = True
-                s["hint"] = f"需手动去{pan_name}下载"
-            elif s.get("source") in ("下载资源", "DuckDuckGo", "Bing"):
-                s["type_label"] = "资源页"
-                s["type_icon"] = "📄"
-                s["hint"] = label or "需手动操作"
-                # 从搜索词携带网盘上下文
-                if s.get("_search_pan") and not s.get("_page_pan"):
-                    s["_page_pan"] = s["_search_pan"]
-            else:
-                s["type_label"] = "网页"
-                s["type_icon"] = "🌐"
-                s["hint"] = label or ""
-            
-            if speed and avail:
-                if speed < 1000:
-                    s["speed_badge"] = f"⚡{speed}ms"
-                elif speed < 3000:
-                    s["speed_badge"] = f"⏱{speed}ms"
-                else:
-                    s["speed_badge"] = f"🐢{round(speed/1000,1)}s"
-            elif speed:
-                s["speed_badge"] = f"✗{round(speed/1000,1)}s"
-            else:
-                s["speed_badge"] = ""
-            
-            if not avail and error:
-                if "解说" in error or "预告" in error:
-                    page_warnings.append(f"已排除 解说/预告片")
-                elif "无做种" in error:
-                    page_warnings.append("磁力链接无做种者")
-            
-            filtered.append(s)
-        
-        avail_count = len([s for s in filtered if s.get("available")])
-        manual_count = len([s for s in filtered if s.get("manual_open")])
-        page_hint_parts = []
-        if avail_count > 0:
-            fastest = next((s for s in filtered if s.get("available")), None)
-            fastest_speed = f"⚡最快 {fastest.get('speed_badge', '')}" if fastest and fastest.get("speed_badge") else ""
-            page_hint_parts.append(f"✅ {avail_count} 个可自动下载 {fastest_speed}".strip())
-        if manual_count > 0:
-            page_hint_parts.append(f"📄 {manual_count} 个需手动操作")
-        magnets = [s for s in filtered if s.get("type_label") == "磁力链接" and s.get("available")]
-        if magnets:
-            page_hint_parts.append(f"🔗 {len(magnets)} 磁链有做种")
-        page_hint = " | ".join(page_hint_parts) if page_hint_parts else ""
-        if page_warnings:
-            page_hint += (" | " if page_hint else "") + " ⚠️ " + "；".join(set(page_warnings))
-    
-    server.send_json({
-        "success": True,
-        "media_id": media_id,
-        "title": title,
-        "sources": filtered,
-        "count": len(filtered),
-        "avail_count": avail_count,
-        "manual_count": manual_count,
-        "page_hint": page_hint,
-        "message": f"✅ {avail_count} 个可自动下载" + (f" | 📄 {manual_count} 个需手动打开" if manual_count else "") if avail_count else (f"📄 {manual_count} 个需手动打开 | 无自动下载源" if manual_count else "所有源均不可用，试试手动输入URL")
-    })
+
+    try:
+        job_id = start_auto_search_task(media_id, media)
+    except Exception as e:
+        server.send_json({"success": False, "error": str(e), "job_id": None}, 500)
+        return
+
+    server.send_json(
+        {
+            "success": True,
+            "job_id": job_id,
+            "media_id": media_id,
+            "message": "搜索任务已提交，请通过 /api/auto-result 轮询结果",
+        }
+    )
+
+
+def handle_auto_result(server, query, download_manager):
+    """处理 /api/auto-result — 返回指定 job 的结果或 processing 状态"""
+    job_id = query.get("job_id", "")
+    if not job_id:
+        server.send_json({"success": False, "error": "缺少 job_id"}, 400)
+        return
+
+    result = get_auto_find_result(job_id)
+    if result is None:
+        server.send_json({"success": False, "error": "job 不存在或已过期"}, 404)
+        return
+
+    server.send_json({"success": True, **result})
+
+
+
+
 
 
 # ─── API 处理器 ───────────────────────────────────
@@ -1180,18 +1145,21 @@ def handle_dl_url(server, query, download_manager):
     """处理 /api/dl-url 请求 — 从外部URL下载"""
     url = query.get("url", "")
     title = query.get("title", "")
-    
+
     if not url:
         server.send_json({"success": False, "error": "缺少URL参数"}, 400)
         return
-    
+
     dl = YtDlpDownloader(download_manager)
     item_id = dl.add_url_download(url, title=title or url)
-    
+
     # Start download in background
-    t = threading.Thread(target=dl.execute_download, args=(next(i for i in download_manager.queue if i["id"] == item_id),), daemon=True)
-    t.start()
-    
+    item = next((i for i in download_manager.queue if i["id"] == item_id), None)
+    if item is None:
+        server.send_json({"success": False, "error": "下载任务创建失败"})
+        return
+    _download_executor.submit(dl.execute_download, item)
+
     server.send_json({"success": True, "id": item_id, "title": title or url})
 
 
@@ -1387,7 +1355,8 @@ def _load_subs():
         with _SUBS_LOCK:
             with open(SUBS_FILE) as f:
                 return json.load(f)
-    except:
+    except Exception as e:
+        print(f"[_load_subs] error: {e}")
         return []
 
 
@@ -1426,25 +1395,26 @@ def handle_subscribe(server, query, download_manager):
         server.send_json({"success": False, "error": "仅支持电视剧订阅（需有集数信息）"}, 400)
         return
 
-    subs = _load_subs()
-    # 检查是否已订阅
-    for s in subs:
-        if s.get("title") == title and s.get("year") == year:
-            server.send_json({"success": True, "already_subscribed": True, "subscription": s})
-            return
+    with _lock_subs():
+        subs = _load_subs()
+        # 检查是否已订阅
+        for s in subs:
+            if s.get("title") == title and s.get("year") == year:
+                server.send_json({"success": True, "already_subscribed": True, "subscription": s})
+                return
 
-    sub = {
-        "id": media_id,
-        "title": title,
-        "year": year or "",
-        "episodes": episodes,
-        "downloaded_eps": [],       # 已下载的集号
-        "added_at": datetime.now().isoformat(),
-        "last_checked": None,
-        "status": "active",
-    }
-    subs.append(sub)
-    _save_subs(subs)
+        sub = {
+            "id": media_id,
+            "title": title,
+            "year": year or "",
+            "episodes": episodes,
+            "downloaded_eps": [],       # 已下载的集号
+            "added_at": datetime.now().isoformat(),
+            "last_checked": None,
+            "status": "active",
+        }
+        subs.append(sub)
+        _save_subs(subs)
 
     # 立即执行一次搜索下载
     threading.Thread(target=check_subscription, args=(sub, download_manager), daemon=True).start()
@@ -1461,18 +1431,19 @@ def handle_unsubscribe(server, query, download_manager):
     media_id = query.get("id", "")
     title = query.get("title", "")
 
-    subs = _load_subs()
-    before = len(subs)
+    with _lock_subs():
+        subs = _load_subs()
+        before = len(subs)
 
-    if media_id:
-        subs = [s for s in subs if s.get("id") != media_id]
-    elif title:
-        subs = [s for s in subs if s.get("title") != title]
-    else:
-        server.send_json({"success": False, "error": "缺少媒体ID或标题"}, 400)
-        return
+        if media_id:
+            subs = [s for s in subs if s.get("id") != media_id]
+        elif title:
+            subs = [s for s in subs if s.get("title") != title]
+        else:
+            server.send_json({"success": False, "error": "缺少媒体ID或标题"}, 400)
+            return
 
-    _save_subs(subs)
+        _save_subs(subs)
     removed = before - len(subs)
     server.send_json({"success": True, "removed": removed, "remaining": len(subs)})
 
@@ -1518,12 +1489,10 @@ def check_subscription(sub, download_manager):
         # 对 yt-dlp 支持的源，加 --playlist-start/end 指定剧集；非播放列表源跳过
         dl = YtDlpDownloader(download_manager)
         item_id = dl.add_url_download(url, title=ep_title, episode=ep)
-        t = threading.Thread(
-            target=dl.execute_download,
-            args=(next((i for i in download_manager.queue if i["id"] == item_id), None),),
-            daemon=True
-        )
-        t.start()
+        item = next((i for i in download_manager.queue if i["id"] == item_id), None)
+        if item is None:
+            continue
+        _download_executor.submit(dl.execute_download, item)
         downloaded.add(ep)
         new_downloads.append(ep)
 
@@ -1534,14 +1503,15 @@ def check_subscription(sub, download_manager):
     sub["downloaded_eps"] = sorted(downloaded)
     sub["last_checked"] = datetime.now().isoformat()
 
-    # 保存到文件
-    all_subs = _load_subs()
-    for s in all_subs:
-        if s.get("id") == sub.get("id"):
-            s["downloaded_eps"] = sub["downloaded_eps"]
-            s["last_checked"] = sub["last_checked"]
-            break
-    _save_subs(all_subs)
+    # 保存到文件（线程安全，加锁保护）
+    with _lock_subs():
+        all_subs = _load_subs()
+        for s in all_subs:
+            if s.get("id") == sub.get("id"):
+                s["downloaded_eps"] = sub["downloaded_eps"]
+                s["last_checked"] = sub["last_checked"]
+                break
+        _save_subs(all_subs)
 
     # 记录日志
     if new_downloads:
@@ -1549,16 +1519,21 @@ def check_subscription(sub, download_manager):
         log_entry = {"title": title, "downloaded": new_downloads, "time": now}
         log_file = Path.home() / "services/streaming-server" / "subscription_log.json"
         try:
-            if log_file.exists():
-                with open(log_file) as f:
+            with open(log_file, "a+") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                f.seek(0)
+                try:
                     log = json.load(f)
-            else:
-                log = []
-            log.append(log_entry)
-            with open(log_file, "w") as f:
+                except Exception:
+                    log = []
+                log.append(log_entry)
+                f.seek(0)
+                f.truncate(0)
                 json.dump(log, f, ensure_ascii=False, indent=2)
-        except:
-            pass
+                f.flush()
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception as e:
+            print(f"[check_subscription] log write error: {e}")
 
 
 def check_all_subscriptions(download_manager):
@@ -1568,105 +1543,21 @@ def check_all_subscriptions(download_manager):
     for sub in active:
         try:
             check_subscription(sub, download_manager)
-        except:
-            pass
+        except Exception as e:
+            print(f"[check_all_subscriptions] error for {sub.get('title')}: {e}")
 
 
 # ─── 订阅定时任务入口（cron调用） ───────────────────
 def run_subscription_check():
-    """供cron调用的入口，自动检查所有订阅（直接写队列文件避免独立实例）"""
-    subs = _load_subs()
-    active = [s for s in subs if s.get("status") == "active"]
-    if not active:
+    from stream_server_v3 import StreamHandler
+    dm = StreamHandler.download_manager
+    if dm is None:
         now = datetime.now().isoformat()
-        print(f"[{now}] 无活跃订阅，跳过")
+        print(f"[{now}] download_manager 未初始化，跳过")
         return
 
-    # 读取主服务器的队列文件，直接追加下载任务
-    queue_file = Path.home() / "services/streaming-server" / "download_queue.json"
-    try:
-        if queue_file.exists():
-            with _lock_subs():
-                with open(queue_file) as f:
-                    queue = json.load(f)
-        else:
-            queue = []
-    except:
-        queue = []
+    check_all_subscriptions(dm)
 
-    for sub in active:
-        try:
-            title = sub.get("title", "")
-            year = sub.get("year", "")
-            episodes = sub.get("episodes", 0)
-            downloaded = set(sub.get("downloaded_eps", []))
-            if not title or episodes <= 0:
-                continue
-
-            sources = auto_search_sources(title, year, "电视剧")
-            if not sources:
-                continue
-            tested = test_all_sources(sources)
-            available = [s for s in tested if s.get("available")]
-            if not available:
-                continue
-
-            best = available[0]
-            url = best.get("url", "")
-            new_eps = []
-
-            for ep in range(1, episodes + 1):
-                if ep in downloaded:
-                    continue
-                item = {
-                    "id": f"sub_{int(time.time() * 1000)}_{ep}",
-                    "title": f"{title} EP{ep:02d}",
-                    "url": url,
-                    "episode": ep,
-                    "filename": "",
-                    "dl_type": "ytdlp",
-                    "status": "pending",
-                    "progress": 0,
-                    "speed": "0 MB/s",
-                    "added_at": datetime.now().isoformat(),
-                    "started_at": None,
-                    "completed_at": None,
-                    "error": None,
-                    "output_path": str(VIDEO_DIR)
-                }
-                queue.append(item)
-                downloaded.add(ep)
-                new_eps.append(ep)
-                if len(new_eps) >= 3:
-                    break
-
-            # 更新订阅状态
-            sub["downloaded_eps"] = sorted(downloaded)
-            sub["last_checked"] = datetime.now().isoformat()
-            if new_eps:
-                log_file = Path.home() / "services/streaming-server" / "subscription_log.json"
-                try:
-                    if log_file.exists():
-                        with open(log_file) as f:
-                            log = json.load(f)
-                    else:
-                        log = []
-                    log.append({"title": title, "downloaded": new_eps, "time": datetime.now().isoformat()})
-                    with open(log_file, "w") as f:
-                        json.dump(log, f, ensure_ascii=False, indent=2)
-                except:
-                    pass
-        except:
-            pass
-
-    # 写回队列和订阅文件
-    with _lock_subs():
-        with open(queue_file, "w") as f:
-            json.dump(queue, f, ensure_ascii=False, indent=2)
-        _save_subs(subs)
-
-    now = datetime.now().isoformat()
-    print(f"[{now}] 订阅检查完成，共检查{len(active)}个订阅，新增{sum(len([ep for ep in range(1,s.get('episodes',0)+1) if ep not in set(s.get('downloaded_eps',[]))]) for s in active)}个下载")
 
 
 
@@ -1699,3 +1590,71 @@ if __name__ == "__main__":
         print(f"📚 数据库: {DB_FILE}")
         print(f"⏹️  按 Ctrl+C 停止")
         httpd.serve_forever()
+
+
+def handle_save_source(server, query, download_manager=None):
+    """保存单个资源到当前影片"""
+    import database
+    media_id = (query.get("media_id") or "").strip()
+    url = (query.get("url") or "").strip()
+    source = (query.get("source") or "").strip()
+    pwd = (query.get("pwd") or "").strip()
+    if not media_id or not url:
+        server.send_json({"ok": False, "msg": "缺少 media_id 或 url"})
+        return
+    item = {
+        "url": url,
+        "title": (query.get("title") or "").strip(),
+        "source": source or "手动保存",
+        "type": "external",
+    }
+    if pwd:
+        item["pwd"] = pwd
+    db = database.get_database()
+    for m in db.get("movies", []):
+        if m.get("id") == media_id:
+            m.setdefault("resource_sources", []).append(item)
+            with open(database.DB_FILE, "w", encoding="utf-8") as f:
+                f.write(json.dumps(db, ensure_ascii=False, indent=2))
+            server.send_json({"ok": True, "msg": "已保存"})
+            return
+    server.send_json({"ok": False, "msg": "未找到影片"})
+
+
+def handle_save_search_to_library(server, query, download_manager=None):
+    """外部搜索结果一键入库 => database.json"""
+    import database
+    title = (query.get("title") or "").strip()
+    url = (query.get("url") or "").strip()
+    if not title or not url:
+        server.send_json({"ok": False, "msg": "缺少 title 或 url"})
+        return
+    db = database.get_database()
+    mid = "ext-%d" % int(time.time() * 1000)
+    entry = {
+        "id": mid,
+        "title": title,
+        "year": (query.get("year") or "").strip(),
+        "type": query.get("type") or "电影",
+        "rating": float(query.get("rating") or 0),
+        "genre": query.get("genre") or "",
+        "poster": query.get("poster") or "",
+        "douban_url": query.get("douban_url") or "",
+        "douban_id": query.get("douban_id") or "",
+        "episodes": int(query.get("episodes") or 0),
+        "created_at": datetime.now().isoformat(),
+        "resource_sources": [
+            {
+                "url": url,
+                "title": query.get("title") or title,
+                "source": query.get("source") or "外部入库",
+                "type": "external",
+                "pwd": query.get("pwd") or "",
+                "added_at": datetime.now().isoformat(),
+            }
+        ],
+    }
+    db.setdefault("movies", []).append(entry)
+    with open(database.DB_FILE, "w", encoding="utf-8") as f:
+        f.write(json.dumps(db, ensure_ascii=False, indent=2))
+    server.send_json({"ok": True, "media_id": mid})

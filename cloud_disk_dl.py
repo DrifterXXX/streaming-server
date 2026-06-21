@@ -19,6 +19,7 @@ import re
 import sys
 import json
 import time
+import random
 import shutil
 import subprocess
 import threading
@@ -30,8 +31,14 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# 统一登录管理器
-from pan_login import PanLoginManager
+_LOGIN_MGR = None
+def _get_login_mgr():
+    global _LOGIN_MGR
+    if _LOGIN_MGR is None:
+        from pan_login import PanLoginManager
+        _LOGIN_MGR = PanLoginManager()
+    return _LOGIN_MGR
+
 
 # 网盘 API 直连层
 from pan_api import AliyunAPI, BaiduAPI, QuarkAPI, TianyiAPI, XunleiAPI
@@ -58,7 +65,10 @@ except ImportError:
 # ─── 路径配置 ──────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent.resolve()
 VIDEO_DIR = BASE_DIR / "videos"
-VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+
+def _ensure_video_dir():
+    """延迟初始化视频目录，避免 import-time 副作用"""
+    VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 
 # ─── 网盘检测 ──────────────────────────────────────────────
 
@@ -98,8 +108,9 @@ def extract_password(url: str):
 # ─── 通用下载辅助 ──────────────────────────────────────────
 
 def _download_direct(url: str, output_path: Path, progress_callback=None):
-    """通过临时直链下载文件，支持进度回调"""
+    """通过临时直链下载文件，支持进度回调。先写入 .tmp 再重命名，防止部分文件残留"""
     start_time = time.time()
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
 
     def report_hook(block_num, block_size, total_size):
         if progress_callback and total_size > 0:
@@ -109,7 +120,8 @@ def _download_direct(url: str, output_path: Path, progress_callback=None):
             speed = downloaded / elapsed / 1024 / 1024 if elapsed > 0 else 0
             progress_callback(pct, f"{speed:.1f} MB/s")
 
-    urllib.request.urlretrieve(url, str(output_path), report_hook)
+    urllib.request.urlretrieve(url, str(tmp_path), report_hook)
+    shutil.move(str(tmp_path), str(output_path))
 
 
 def _find_video_in_files(files, title: str = ""):
@@ -137,7 +149,7 @@ class AliyunEngine:
     """阿里云盘下载引擎 — 基于 pan_api.AliyunAPI + pan_login"""
 
     def __init__(self):
-        self.login_mgr = PanLoginManager()
+        self.login_mgr = _get_login_mgr()
         self.api = AliyunAPI(self.login_mgr)
         # 保留 CLI 路径用于兜底
         self.bin = shutil.which('aliyunpan')
@@ -215,24 +227,26 @@ class AliyunEngine:
         if progress_callback:
             progress_callback(50, '转存成功，正在获取下载链接...')
 
-        # 4. 在用户网盘中搜索刚转存的文件
-        time.sleep(1)  # 等待转存完成
-        searched = self.api.search_file(video_name)
+        # 4. 在用户网盘中轮询刚转存的文件，避免固定 sleep 导致取直链失败
         target_file = None
-        for f in searched:
-            fname = f.get("name") or ""
-            if video_name in fname:
-                target_file = f
-                break
-        if not target_file:
-            # 搜索不到，尝试列出根目录
-            listed = self.api.list_files("root")
-            for f in listed:
-                fname = f.get("name") or ""
-                if video_name in fname:
+        for attempt in range(20):
+            searched = self.api.search_file(video_name)
+            for f in searched:
+                fname = (f.get("name") or "").strip()
+                if video_name and video_name in fname:
                     target_file = f
                     break
-
+            if target_file:
+                break
+            listed = self.api.list_files("root")
+            for f in listed:
+                fname = (f.get("name") or "").strip()
+                if video_name and video_name in fname:
+                    target_file = f
+                    break
+            if target_file:
+                break
+            time.sleep(0.5)
         if not target_file:
             return {'success': False, 'error': '转存成功但无法在网盘中找到文件'}
 
@@ -254,7 +268,7 @@ class AliyunEngine:
 
         # 6. 下载文件
         output_name = re.sub(r'[^\w一-鿿\s-]', '', video_name)
-        output_path = VIDEO_DIR / f"{output_name}_{int(time.time())}.mp4"
+        output_path = VIDEO_DIR / f"{output_name}_{int(time.time())}_{os.getpid()}_{random.randint(1000,9999)}.mp4"
 
         try:
             _download_direct(download_url, output_path, progress_callback)
@@ -273,20 +287,29 @@ class AliyunEngine:
             else:
                 return {'success': False, 'error': '下载完成但文件过小'}
         except Exception as e:
-            return {'success': False, 'error': f'下载失败: {e}'}
+            logger.error(f"下载失败: {e}", exc_info=True)
+            return {'success': False, 'error': '下载失败，请稍后重试'}
 
     def _cli_download_after_save(self, title, progress_callback):
         """浏览器转存成功后，通过 CLI 下载"""
         if not self.bin:
             return {'success': False, 'error': 'aliyunpan CLI 未安装'}
         try:
-            output_name = re.sub(r'[^\w一-鿿\s-]', '', title or 'download')
-            cmd = [self.bin, 'download', '--saveto', str(VIDEO_DIR), '/']
-            subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            files = list(VIDEO_DIR.glob("*"))
-            new_files = [f for f in files if f.stat().st_mtime > time.time() - 610
-                         and f.suffix.lower() in ('.mp4', '.mkv', '.webm', '.avi')
-                         and f.stat().st_size > 1024 * 1024]
+            output_name_cli = re.sub(r'[^\w一-鿿\s-]', '', title or 'download')
+            cmd = [self.bin, 'download', '--saveto', str(VIDEO_DIR), f'/{title}']
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode != 0:
+                return {'success': False, 'error': f'CLI下载失败: {result.stderr[:200]}'}
+            marker = VIDEO_DIR / f".dl_marker_{int(time.time()*1000)}_{os.getpid()}"
+            marker.touch()
+            try:
+                files = list(VIDEO_DIR.glob("*"))
+                new_files = [f for f in files
+                             if f.stat().st_mtime > marker.stat().st_mtime
+                             and f.suffix.lower() in ('.mp4', '.mkv', '.webm', '.avi')
+                             and f.stat().st_size > 1024 * 1024]
+            finally:
+                marker.unlink(missing_ok=True)
             if new_files:
                 newest = max(new_files, key=lambda f: f.stat().st_size)
                 size_mb = round(newest.stat().st_size / 1024 / 1024, 1)
@@ -301,7 +324,8 @@ class AliyunEngine:
                 }
             return {'success': False, 'error': '转存成功但下载时未找到视频文件'}
         except Exception as e:
-            return {'success': False, 'error': f'下载失败: {e}'}
+            logger.error(f"下载失败: {e}", exc_info=True)
+            return {'success': False, 'error': '下载失败，请稍后重试'}
 
     def _cli_download(self, url, title, progress_callback):
         """非分享链接的 CLI 下载兜底"""
@@ -309,13 +333,21 @@ class AliyunEngine:
             return {'success': False, 'error': 'aliyunpan CLI 未安装'}
         try:
             file_path = url if url.startswith('/') else url
-            output_name = re.sub(r'[^\w一-鿿\s-]', '', title or 'download')
+            output_name_cli = re.sub(r'[^\w一-鿿\s-]', '', title or 'download')
             cmd = [self.bin, 'download', '--saveto', str(VIDEO_DIR), file_path]
-            subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            files = list(VIDEO_DIR.glob("*"))
-            new_files = [f for f in files if f.stat().st_mtime > time.time() - 610
-                         and f.suffix.lower() in ('.mp4', '.mkv', '.webm', '.avi')
-                         and f.stat().st_size > 1024 * 1024]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode != 0:
+                return {'success': False, 'error': f'CLI下载失败: {result.stderr[:200]}'}
+            marker = VIDEO_DIR / f".dl_marker_{int(time.time()*1000)}_{os.getpid()}"
+            marker.touch()
+            try:
+                files = list(VIDEO_DIR.glob("*"))
+                new_files = [f for f in files
+                             if f.stat().st_mtime > marker.stat().st_mtime
+                             and f.suffix.lower() in ('.mp4', '.mkv', '.webm', '.avi')
+                             and f.stat().st_size > 1024 * 1024]
+            finally:
+                marker.unlink(missing_ok=True)
             if new_files:
                 newest = max(new_files, key=lambda f: f.stat().st_size)
                 size_mb = round(newest.stat().st_size / 1024 / 1024, 1)
@@ -328,7 +360,8 @@ class AliyunEngine:
                 }
             return {'success': False, 'error': '下载完成但未找到视频文件'}
         except Exception as e:
-            return {'success': False, 'error': f'阿里云盘下载失败: {e}'}
+            logger.error(f"阿里云盘下载失败: {e}", exc_info=True)
+            return {'success': False, 'error': '下载失败，请稍后重试'}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -339,7 +372,7 @@ class BaiduEngine:
     """百度网盘下载引擎 — 基于 pan_api.BaiduAPI + pan_login"""
 
     def __init__(self):
-        self.login_mgr = PanLoginManager()
+        self.login_mgr = _get_login_mgr()
         self.api = BaiduAPI(self.login_mgr)
         self.bin = shutil.which('BaiduPCS-Go')
 
@@ -415,7 +448,7 @@ class BaiduEngine:
 
         # 4. 下载文件
         output_name = re.sub(r'[^\w一-鿿\s-]', '', video_name)
-        output_path = VIDEO_DIR / f"{output_name}_{int(time.time())}.mp4"
+        output_path = VIDEO_DIR / f"{output_name}_{int(time.time())}_{os.getpid()}_{random.randint(1000,9999)}.mp4"
 
         try:
             _download_direct(download_url, output_path, progress_callback)
@@ -434,7 +467,8 @@ class BaiduEngine:
             else:
                 return {'success': False, 'error': '下载完成但文件过小'}
         except Exception as e:
-            return {'success': False, 'error': f'下载失败: {e}'}
+            logger.error(f"下载失败: {e}", exc_info=True)
+            return {'success': False, 'error': '下载失败，请稍后重试'}
 
     def _cli_download(self, url, title, pwd, progress_callback):
         """通过 BaiduPCS-Go CLI 兜底下载"""
@@ -442,14 +476,24 @@ class BaiduEngine:
             return {'success': False, 'error': 'BaiduPCS-Go 未安装'}
         try:
             transfer_cmd = [self.bin, 'transfer', url]
-            subprocess.run(transfer_cmd, capture_output=True, text=True, timeout=30)
-            output_filename = f"{title}_{int(time.time())}.mp4"
-            dl_cmd = [self.bin, 'download', '/', '--saveto', str(VIDEO_DIR)]
-            subprocess.run(dl_cmd, capture_output=True, text=True, timeout=600)
-            files = list(VIDEO_DIR.glob("*"))
-            new_files = [f for f in files if f.stat().st_mtime > time.time() - 610
-                         and f.suffix.lower() in ('.mp4', '.mkv', '.webm')
-                         and f.stat().st_size > 1024 * 1024]
+            transfer_result = subprocess.run(transfer_cmd, capture_output=True, text=True, timeout=30)
+            if transfer_result.returncode != 0:
+                return {'success': False, 'error': f'转存失败: {transfer_result.stderr[:200]}'}
+            output_name_cli = re.sub(r'[^\w一-鿿\s-]', '', title or 'download')
+            dl_cmd = [self.bin, 'download', f'/{output_name_cli}', '--saveto', str(VIDEO_DIR)]
+            dl_result = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=600)
+            if dl_result.returncode != 0:
+                return {'success': False, 'error': f'CLI下载失败: {dl_result.stderr[:200]}'}
+            marker = VIDEO_DIR / f".dl_marker_{int(time.time()*1000)}_{os.getpid()}"
+            marker.touch()
+            try:
+                files = list(VIDEO_DIR.glob("*"))
+                new_files = [f for f in files
+                             if f.stat().st_mtime > marker.stat().st_mtime
+                             and f.suffix.lower() in ('.mp4', '.mkv', '.webm')
+                             and f.stat().st_size > 1024 * 1024]
+            finally:
+                marker.unlink(missing_ok=True)
             if new_files:
                 newest = max(new_files, key=lambda f: f.stat().st_size)
                 size_mb = round(newest.stat().st_size / 1024 / 1024, 1)
@@ -462,7 +506,8 @@ class BaiduEngine:
                 }
             return {'success': False, 'error': 'CLI 下载完成但未找到视频文件'}
         except Exception as e:
-            return {'success': False, 'error': f"百度网盘 CLI 下载失败: {str(e)}"}
+            logger.error(f"百度网盘 CLI 下载失败: {e}", exc_info=True)
+            return {'success': False, 'error': 'CLI下载失败，请稍后重试'}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -473,7 +518,7 @@ class QuarkEngine:
     """夸克网盘下载引擎 — 基于 pan_api.QuarkAPI + pan_login"""
 
     def __init__(self):
-        self.login_mgr = PanLoginManager()
+        self.login_mgr = _get_login_mgr()
         self.api = QuarkAPI(self.login_mgr)
         self.bin = shutil.which('quarkpan')
 
@@ -561,7 +606,7 @@ class QuarkEngine:
 
         # 6. 下载文件
         output_name = re.sub(r'[^\w一-鿿\s-]', '', video_name)
-        output_path = VIDEO_DIR / f"{output_name}_{int(time.time())}.mp4"
+        output_path = VIDEO_DIR / f"{output_name}_{int(time.time())}_{os.getpid()}_{random.randint(1000,9999)}.mp4"
 
         try:
             _download_direct(download_url, output_path, progress_callback)
@@ -580,7 +625,8 @@ class QuarkEngine:
             else:
                 return {'success': False, 'error': '下载完成但文件过小'}
         except Exception as e:
-            return {'success': False, 'error': f'下载失败: {e}'}
+            logger.error(f"下载失败: {e}", exc_info=True)
+            return {'success': False, 'error': '下载失败，请稍后重试'}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -591,7 +637,7 @@ class TianyiEngine:
     """天翼云盘下载引擎 — 基于 pan_api.TianyiAPI + pan_login"""
 
     def __init__(self):
-        self.login_mgr = PanLoginManager()
+        self.login_mgr = _get_login_mgr()
         self.api = TianyiAPI(self.login_mgr)
 
     def is_logged_in(self) -> bool:
@@ -666,7 +712,7 @@ class TianyiEngine:
 
         # 4. 下载文件
         output_name = re.sub(r'[^\w一-鿿\s-]', '', video_name)
-        output_path = VIDEO_DIR / f"{output_name}_{int(time.time())}.mp4"
+        output_path = VIDEO_DIR / f"{output_name}_{int(time.time())}_{os.getpid()}_{random.randint(1000,9999)}.mp4"
 
         try:
             _download_direct(download_url, output_path, progress_callback)
@@ -685,7 +731,8 @@ class TianyiEngine:
             else:
                 return {'success': False, 'error': '下载完成但文件过小'}
         except Exception as e:
-            return {'success': False, 'error': f'下载失败: {e}'}
+            logger.error(f"下载失败: {e}", exc_info=True)
+            return {'success': False, 'error': '下载失败，请稍后重试'}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -696,7 +743,7 @@ class XunleiEngine:
     """迅雷云盘下载引擎 — 基于 pan_api.XunleiAPI + pan_login"""
 
     def __init__(self):
-        self.login_mgr = PanLoginManager()
+        self.login_mgr = _get_login_mgr()
         self.api = XunleiAPI(self.login_mgr)
 
     def is_logged_in(self) -> bool:
@@ -771,7 +818,7 @@ class XunleiEngine:
 
         # 4. 下载文件
         output_name = re.sub(r'[^\w一-鿿\s-]', '', video_name)
-        output_path = VIDEO_DIR / f"{output_name}_{int(time.time())}.mp4"
+        output_path = VIDEO_DIR / f"{output_name}_{int(time.time())}_{os.getpid()}_{random.randint(1000,9999)}.mp4"
 
         try:
             _download_direct(download_url, output_path, progress_callback)
@@ -790,7 +837,8 @@ class XunleiEngine:
             else:
                 return {'success': False, 'error': '下载完成但文件过小'}
         except Exception as e:
-            return {'success': False, 'error': f'下载失败: {e}'}
+            logger.error(f"下载失败: {e}", exc_info=True)
+            return {'success': False, 'error': '下载失败，请稍后重试'}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -801,7 +849,8 @@ class CloudDiskDL:
     """网盘自动下载引擎统一入口"""
 
     def __init__(self):
-        self.login_mgr = PanLoginManager()
+        self.login_mgr = _get_login_mgr()
+        _ensure_video_dir()
         self.engines = {
             'aliyun': AliyunEngine(),
             'baidu': BaiduEngine(),

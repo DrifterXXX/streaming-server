@@ -227,6 +227,14 @@
         .btn-add-library { background: #28a745; color: #fff; }
         .btn-add-library:hover { background: #34ce57; }
         .btn-add-library:disabled { opacity: 0.6; cursor: not-allowed; }
+        .card-country-badge {
+            background: rgba(255,255,255,0.08);
+            border: 1px solid rgba(255,255,255,0.08);
+            color: var(--text-secondary);
+            padding: 2px 8px;
+            border-radius: 6px;
+            font-size: 0.75rem;
+        }
         /* 收藏按钮 */
         .btn-favorite { flex: 0 0 auto; width: 36px; padding: 8px; background: rgba(255,255,255,0.05); color: var(--text-secondary); border: 1px solid rgba(255,255,255,0.1); }
         .btn-favorite:hover { background: rgba(233,69,96,0.2); color: var(--accent); border-color: var(--accent); }
@@ -745,6 +753,18 @@
             <span class="cat-filter" data-cat="电影" onclick="filterCategory('电影')">电影</span>
             <span class="cat-filter" data-cat="电视剧" onclick="filterCategory('电视剧')">电视剧</span>
         </div>
+        <!-- Country Filter -->
+        <div class="category-filters" id="countryFilters" style="margin-top:8px;">
+            <span style="color:var(--text-secondary);font-size:0.85rem;margin-right:8px;"><i class="fas fa-globe-asia"></i> 地区:</span>
+            <span class="cat-filter active" data-country="all" onclick="filterCountry('all', this)">全部</span>
+            <span class="cat-filter" data-country="中国" onclick="filterCountry('中国', this)">中国</span>
+            <span class="cat-filter" data-country="美国" onclick="filterCountry('美国', this)">美国</span>
+            <span class="cat-filter" data-country="日本" onclick="filterCountry('日本', this)">日本</span>
+            <span class="cat-filter" data-country="韩国" onclick="filterCountry('韩国', this)">韩国</span>
+            <span class="cat-filter" data-country="中国(香港)" onclick="filterCountry('中国(香港)', this)">中国香港</span>
+            <span class="cat-filter" data-country="英国" onclick="filterCountry('英国', this)">英国</span>
+            <span class="cat-filter" data-country="其他" onclick="filterCountry('其他', this)">其他</span>
+        </div>
 
         <!-- Sort Bar -->
         <div class="category-filters" id="sortBar">
@@ -1145,6 +1165,8 @@
             reRenderHome();
         }
 
+        let currentCountry = 'all';
+
         function filterCategory(cat) {
             currentCategory = cat;
             document.querySelectorAll('#categoryFilters .cat-filter').forEach(t => t.classList.remove('active'));
@@ -1152,9 +1174,23 @@
             reRenderHome();
         }
 
+        function filterCountry(country, el) {
+            currentCountry = country;
+            document.querySelectorAll('#countryFilters .cat-filter').forEach(t => t.classList.remove('active'));
+            if (el) el.classList.add('active');
+            const fallback = document.querySelector(`#countryFilters [data-country="${country}"]`);
+            if (fallback && !el) fallback.classList.add('active');
+            reRenderHome();
+        }
+
         function reRenderHome() {
-            const movies = allDatabaseItems.filter(m => m.type === '电影');
-            const tvShows = allDatabaseItems.filter(m => m.type === '电视剧');
+            const videos = allDatabaseItems.filter(m => {
+                const typeOk = (currentCategory === 'all') || (m.type === currentCategory);
+                const countryOk = (currentCountry === 'all') || (m.country === currentCountry) || (!m.country && currentCountry === '其他');
+                return typeOk && countryOk;
+            });
+            const movies = videos.filter(m => m.type === '电影');
+            const tvShows = videos.filter(m => m.type === '电视剧');
 
             // 排序
             const sorted = applySort([...movies]);
@@ -1260,7 +1296,8 @@
             for (let attempt = 1; attempt <= retryCount; attempt++) {
                 try {
                     const res = await fetch('/api/database');
-                    const allMovies = await res.json();
+                    const body = await res.json();
+                    const allMovies = Array.isArray(body) ? body : (body.movies || []);
 
                     // Store for sorting/filtering
                     allDatabaseItems = allMovies;
@@ -1342,6 +1379,7 @@
                         <span class="rating-badge ${m.rating >= 8 ? 'rating-high' : 'rating-mid'}" onclick="openDouban('${m.title}', '${m.year || ''}')">${m.rating.toFixed(1)}分</span>
                         <span>${m.year || ''}</span>
                         ${m.episodes ? `<span>${m.episodes}集</span>` : ''}
+                        ${m.country ? `<span class="card-country-badge"><i class="fas fa-flag"></i> ${m.country}</span>` : ''}
                         ${m.genre ? `<span>${m.genre.split('/')[0]}</span>` : ''}
                     </div>
                     ${dlCount > 0 ? `<div class="dl-count-badge"><i class="fas fa-check"></i> 已存${dlCount}集</div>` : ''}
@@ -1607,6 +1645,9 @@
                             <button class="action-btn btn-download" onclick="event.stopPropagation(); searchSourcesForTitle('${item.title.replace(/'/g, "\\'")}', '${item.year || ''}', '${item.type || '电影'}', event)">
                                 <i class="fas fa-search"></i> 搜索资源
                             </button>
+                            <button class="action-btn btn-save-source" onclick="event.stopPropagation(); saveExternalSource(this, '${item.title.replace(/'/g, "\'")}', '${item.year || ''}', ${item.rating || 0}, '${item.type || '电影'}', '${(item.genre || '').replace(/'/g, "\'")}', '${item.poster || ''}', '${item.douban_url || ''}', '${item.douban_id || ''}', ${item.episodes || 0})">
+                                <i class="fas fa-bookmark"></i> 一键入片库
+                            </button>
                             `}
                             <a href="javascript:void(0)" onclick="event.stopPropagation(); openDouban('${item.title}', '${item.year || ''}')" class="action-btn btn-download" style="text-decoration:none;">
                                 <i class="fas fa-external-link-alt"></i> 豆瓣
@@ -1617,7 +1658,35 @@
         }
         
         // Add an external search result to the media library
-        async function addToLibrary(btn, title, year, rating, type, genre, poster, doubanUrl, doubanId, episodes) {
+                async function saveExternalSource(btn, title, year, rating, type, genre, poster, doubanUrl, doubanId, episodes) {
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 入片中...';
+            btn.disabled = true;
+            try {
+                const params = new URLSearchParams({
+                    title, year:'', rating: String(rating), type, genre, poster,
+                    douban_url: doubanUrl, douban_id: doubanId, episodes: String(episodes),
+                    url:'', source:'', pwd:''
+                });
+                const res = await fetch('/api/save-search-to-library?' + params.toString());
+                const result = await res.json();
+                if (result.success) {
+                    showToast('已入片库: ' + title, 'success');
+                    btn.className = 'action-btn btn-play';
+                    btn.innerHTML = '<i class="fas fa-check"></i> 已入库';
+                    btn.disabled = true;
+                } else {
+                    showToast('保存失败: ' + (result.error || '未知错误'), 'error');
+                    btn.innerHTML = '<i class="fas fa-bookmark"></i> 一键入片库';
+                    btn.disabled = false;
+                }
+            } catch (e) {
+                showToast('请求失败: ' + e.message, 'error');
+                btn.innerHTML = '<i class="fas fa-bookmark"></i> 一键入片库';
+                btn.disabled = false;
+            }
+        }
+
+async function addToLibrary(btn, title, year, rating, type, genre, poster, doubanUrl, doubanId, episodes) {
             btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 添加中...';
             btn.disabled = true;
             
@@ -1857,12 +1926,52 @@
         
         async function fetchAutoSources(id) {
             try {
-                const res = await fetch('/api/auto-find?id=' + encodeURIComponent(id));
-                const data = await res.json();
-                
                 const statusEl = document.getElementById('autoSearchStatus');
                 const resultsEl = document.getElementById('autoSearchResults');
                 const manualEl = document.getElementById('manualDownloadArea');
+
+                let jobRes = await fetch('/api/auto-find?id=' + encodeURIComponent(id));
+                let jobData = await jobRes.json();
+                if (!jobData.success || !jobData.job_id) {
+                    throw new Error(jobData.error || '提交任务失败');
+                }
+                const jobId = jobData.job_id;
+
+                const maxWait = 80000;
+                const start = Date.now();
+                let finalData = null;
+
+                while (Date.now() - start < maxWait) {
+                    await new Promise(r => setTimeout(r, 1500));
+                    const poll = await fetch('/api/auto-result?job_id=' + encodeURIComponent(jobId));
+                    const pollData = await poll.json();
+                    if (pollData.success && pollData.data) {
+                        if (pollData.data.status === 'done' || pollData.data.sources) {
+                            finalData = pollData.data;
+                            break;
+                        }
+                        if (pollData.data.status === 'processing') {
+                            if (statusEl.style.display === 'none') {
+                                statusEl.style.display = 'block';
+                            }
+                            statusEl.querySelector('p') &&
+                                (statusEl.querySelector('p').textContent = '正在持续搜索资源，请稍候...');
+                            continue;
+                        }
+                    }
+                }
+
+                if (!finalData) {
+                    const data = jobData;
+                    statusEl.style.display = 'none';
+                    manualEl.style.display = 'block';
+                    const msg = document.createElement('div');
+                    msg.style.cssText = 'text-align:center;padding:15px;margin-bottom:15px;color:var(--text-secondary);background:var(--bg-secondary);border-radius:8px;font-size:0.9rem;';
+                    msg.innerHTML = '<i class="fas fa-clock"></i> 搜索超时，请切换到手动输入URL';
+                    const h3 = manualEl.querySelector('div');
+                    if (h3) h3.parentNode.insertBefore(msg, h3);
+                    return;
+                }
                 
                 if (data.success && data.sources && data.sources.length > 0) {
                     statusEl.style.display = 'none';

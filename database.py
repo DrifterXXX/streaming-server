@@ -19,6 +19,16 @@ class MediaDB:
     _cache_mtime = 0
 
     @classmethod
+    def _write(cls, db):
+        tmp_path = DB_FILE.with_suffix('.json.tmp')
+        with open(tmp_path, 'w') as f:
+            json.dump(db, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp_path), str(DB_FILE))
+        cls._cache_mtime = 0
+
+    @classmethod
     def get_db(cls):
         """加载数据库（带缓存，文件变化时自动重读）"""
         mtime = 0
@@ -100,7 +110,7 @@ class MediaDB:
             "rating": data.get("rating", 0),
             "type": data.get("type", "电影"),
             "genre": data.get("genre", ""),
-            "poster": "",
+            "poster": data.get("poster", ""),  # 保存海报URL以便后续使用
             "douban_url": data.get("douban_url", ""),
             "douban_id": data.get("douban_id", ""),
             "download_urls": [],
@@ -118,6 +128,66 @@ class MediaDB:
         cls._cache_mtime = 0
 
         return {"success": True, "id": media_id, "entry": entry}
+
+    @classmethod
+    def update_resource_sources(cls, media_id, sources):
+        """
+        按 media_id 写回/合并 resource_sources。
+        sources: list[dict]，每个 dict 至少含 url、source、pan_type、status
+        """
+        db = cls.get_db()
+        for m in db.get("movies", []):
+            if m.get("id") == media_id:
+                existing = {s.get("url"): s for s in m.get("resource_sources", []) if s.get("url")}
+                for raw in sources:
+                    s = cls._normalize_source(raw)
+                    url = s.get("url")
+                    if not url:
+                        continue
+                    base = existing.get(url, {})
+                    existing[url] = {**base, **s, "added_at": base.get("added_at") or datetime.now().isoformat()}
+                m["resource_sources"] = list(existing.values())
+                m["download_urls"] = [s["url"] for s in m["resource_sources"] if s.get("status") in ("available", "need_pwd")]
+                break
+        else:
+            return {"success": False, "error": f"未找到 media_id={media_id}"}
+        cls._write(db)
+        return {"success": True}
+
+    @classmethod
+    def _normalize_source(cls, s):
+        if not isinstance(s, dict):
+            return {"url": "", "source": "", "pan_type": "", "status": "unknown"}
+        out = {
+            "url": s.get("url", ""),
+            "source": s.get("source", ""),
+            "pan_type": s.get("pan_type", "") or s.get("_pan", "") or cls._pan_type_from_url(s.get("url", "")),
+            "status": s.get("status", "available") or ("need_pwd" if s.get("_pwd") else "available"),
+            "title": s.get("title", ""),
+        }
+        if s.get("_pwd"):
+            out["pwd"] = s["_pwd"]
+        if s.get("_pan_key"):
+            out["_pan_key"] = s["_pan_key"]
+        if s.get("use_count"):
+            out["use_count"] = s["use_count"]
+        if s.get("last_checked_at"):
+            out["last_checked_at"] = s["last_checked_at"]
+        if not out["source"] and out["pan_type"]:
+            out["source"] = out["pan_type"]
+        return out
+
+    @classmethod
+    def _pan_type_from_url(cls, url: str):
+        import re
+        for pattern, key in [("pan.baidu.com", "baidu"), ("aliyundrive.com", "aliyun"), ("alipan.com", "aliyun"),
+                             ("quark.cn", "quark"), ("cloud.189.cn", "tianyi"), ("pan.xunlei.com", "xunlei"),
+                             ("115.com", "115"), ("123pan.com", "123pan"), ("lanzou", "lanzou")]:
+            if pattern in url:
+                return key
+        if url.startswith("magnet:"):
+            return "magnet"
+        return "link"
 
     @classmethod
     def get_meta(cls):

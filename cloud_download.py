@@ -4,6 +4,9 @@
 import threading
 from datetime import datetime
 
+# Semaphore to limit concurrent cloud downloads
+_CLOUD_DL_SEMAPHORE = threading.Semaphore(5)
+
 
 def handle_dl_cloud(url, title, download_manager):
     """
@@ -52,10 +55,10 @@ def handle_dl_cloud(url, title, download_manager):
         output_name=f"[网盘] {title or '下载'}.mp4",
     )
     
-    # 后台启动下载
+    # 后台启动下载（通过信号量限制并发数）
     t = threading.Thread(
-        target=_cloud_dl_worker,
-        args=(url, title or pan_info["name"], download_manager),
+        target=_cloud_dl_worker_sem,
+        args=(url, title or url, download_manager),
         daemon=True,
     )
     t.start()
@@ -63,7 +66,8 @@ def handle_dl_cloud(url, title, download_manager):
     return {
         "success": True,
         "id": item_id,
-        "message": f"已开始从{pan_info['name']}自动下载",
+        "status": "queued",
+        "message": f"已排队（等待{pan_info['name']}下载）",
     }
 
 
@@ -77,42 +81,59 @@ def pan_status():
         return {"success": False, "error": str(e)}
 
 
+def _cloud_dl_worker_sem(url, title, download_manager):
+    """Wrapper that acquires semaphore before delegating"""
+    try:
+        _CLOUD_DL_SEMAPHORE.acquire()
+        _cloud_dl_worker(url, title, download_manager)
+    finally:
+        _CLOUD_DL_SEMAPHORE.release()
+
+
 def _cloud_dl_worker(url, title, download_manager):
     """后台网盘下载工作线程"""
     from cloud_disk_dl import CloudDiskDL
     cdd = CloudDiskDL()
-    
-    # 更新队列状态
+
+    # 更新队列状态（使用锁保护）
     item_id = None
-    for item in download_manager.queue:
-        if item["url"] == url and item["status"] == "pending":
-            item_id = item["id"]
-            item["status"] = "downloading"
-            download_manager._save_queue()
-            break
-    
-    def progress(pct, msg):
+    with download_manager._queue_lock:
         for item in download_manager.queue:
-            if item.get("id") == item_id:
-                item["progress"] = pct
-                item["speed"] = msg
+            if item["url"] == url and item["status"] == "pending":
+                item_id = item["id"]
+                item["status"] = "downloading"
                 download_manager._save_queue()
                 break
-    
+
+    if item_id is None:
+        import logging
+        logging.warning(f"[cloud_download] item not found in queue: {url}")
+        return
+
+    def progress(pct, msg):
+        with download_manager._queue_lock:
+            for item in download_manager.queue:
+                if item.get("id") == item_id:
+                    item["progress"] = pct
+                    item["speed"] = msg
+                    download_manager._save_queue()
+                    break
+
     result = cdd.download(url, title, progress_callback=progress)
-    
-    # 更新最终状态
-    for item in download_manager.queue:
-        if item.get("id") == item_id:
-            if result.get("success"):
-                item["status"] = "completed"
-                item["progress"] = 100
-                item["filename"] = result.get("filename", "")
-                item["size"] = result.get("size", 0)
-                item["size_mb"] = result.get("size_mb", 0)
-                item["completed_at"] = datetime.now().isoformat()
-            else:
-                item["status"] = "failed"
-                item["error"] = result.get("error", "下载失败")
-            download_manager._save_queue()
-            break
+
+    # 更新最终状态（使用锁保护）
+    with download_manager._queue_lock:
+        for item in download_manager.queue:
+            if item.get("id") == item_id:
+                if result.get("success"):
+                    item["status"] = "completed"
+                    item["progress"] = 100
+                    item["filename"] = result.get("filename", "")
+                    item["size"] = result.get("size", 0)
+                    item["size_mb"] = result.get("size_mb", 0)
+                    item["completed_at"] = datetime.now().isoformat()
+                else:
+                    item["status"] = "failed"
+                    item["error"] = result.get("error", "下载失败")
+                download_manager._save_queue()
+                break

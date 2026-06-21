@@ -20,6 +20,7 @@ data/
 
 # 下载队列
 download_queue.json
+database.json
 
 # 浏览器缓存
 browser_cache/

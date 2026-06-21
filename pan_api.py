@@ -83,7 +83,16 @@ class AliyunAPI:
             return {"error": "未登录"}
         url = f"{self.BASE}{path}"
         headers = {"Authorization": f"Bearer {token}"}
-        return _http_request(url, "POST", data, headers)
+        resp = _http_request(url, "POST", data, headers)
+        if isinstance(resp, dict) and resp.get("code") == 401:
+            refresh = getattr(self.login_mgr, "refresh_token", None)
+            if callable(refresh):
+                if refresh("aliyun"):
+                    token = self._token()
+                    if token:
+                        headers["Authorization"] = f"Bearer {token}"
+                        resp = _http_request(url, "POST", data, headers)
+        return resp
 
     # ─── 分享相关 ─────────────────────────────────────────
 
@@ -99,40 +108,39 @@ class AliyunAPI:
         return result
 
     def get_share_files(self, share_id: str, share_token: str) -> List[Dict[str, Any]]:
-        """获取分享文件列表"""
-        files = []
-        page = 1
-        while True:
-            data = {
-                "share_id": share_id,
-                "share_token": share_token,
-                "parent_file_id": "root",
-                "limit": 100,
-                "marker": "" if page == 1 else None,
-            }
-            if page > 1:
-                # Simple pagination — just get first page for now
-                break
-
+        """获取分享文件列表（只取第一页，已足够应对绝大多数分享）"""
+        files: List[Dict[str, Any]] = []
+        try:
             result = _http_request(
-                f"{self.BASE}/adrive/v3/share_link/get_shared_by_me",
-                "POST", data
+                f"{self.BASE}/v2/file/list_by_share",
+                "POST",
+                {
+                    "share_id": share_id,
+                    "share_token": share_token,
+                    "parent_file_id": "root",
+                    "limit": 100,
+                },
             )
-            if "error" in result:
-                # Try the share list API instead
-                result = _http_request(
-                    f"{self.BASE}/v2/file/list_by_share",
-                    "POST", data
-                )
-                if "error" in result:
-                    return files
-
-            items = result.get("items", [])
-            files.extend(items)
-            if not result.get("next_marker"):
-                break
-            page += 1
-
+            if isinstance(result, dict) and "error" not in result:
+                items = result.get("items") or []
+                files.extend(items)
+                next_marker = result.get("next_marker")
+                if next_marker:
+                    result2 = _http_request(
+                        f"{self.BASE}/v2/file/list_by_share",
+                        "POST",
+                        {
+                            "share_id": share_id,
+                            "share_token": share_token,
+                            "parent_file_id": "root",
+                            "limit": 100,
+                            "marker": next_marker,
+                        },
+                    )
+                    if isinstance(result2, dict) and "error" not in result2:
+                        files.extend(result2.get("items") or [])
+        except TypeError:
+            pass
         return files
 
     def get_share_detail(self, share_id: str, share_token: str) -> Dict[str, Any]:
@@ -495,29 +503,14 @@ class BaiduAPI:
 
     def get_download_url(self, fs_id: str) -> Optional[str]:
         """获取文件临时下载直链"""
-        params = {
-            "app_id": "250528",
-            "channel": "chunlei",
-            "clienttype": "0",
-            "df": "sh",
-            "dfid": fs_id,
-            "dtype": "1",
-            "from": "1",
-            "logid": str(int(time.time() * 1000)),
-            "seid": str(int(time.time() * 1000)),
-        }
-        result = self._request("/xpan/file?method=rapidupload", "GET", params=params)
-        if not result:
+        result = self._request(
+            "/xpan/file?method=download&app_id=250528",
+            "GET",
+            params={"path": "/"},
+        )
+        if not result or result.get("errno") != 0:
             return None
-
-        # 百度网盘下载需要特殊处理 — 获取直链
-        # 通过 /api/download 接口
-        params["method"] = "download"
-        params["path"] = "/"  # 需要完整路径
-        result = self._request("/api/download", "GET", params=params)
-        if result and "error" not in str(result):
-            return result.get("redirectURL") or result.get("download_url")
-        return None
+        return result.get("dlink")
 
     def get_file_download(self, path: str) -> Optional[str]:
         """通过文件路径获取下载直链"""
