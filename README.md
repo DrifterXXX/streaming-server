@@ -1,99 +1,81 @@
-# Streaming Server
+# Streaming Server — 自托管视频流媒体服务器 | Self-hosted Video Streaming Media Server
+
+自托管视频流媒体服务器，集成多云盘下载引擎。Netflix 风格 Web UI，随时随地观看你的媒体库。
 
 A self-hosted video streaming media server with multi-cloud drive download engine. Watch your media collection from anywhere with a Netflix-style web UI.
 
-## Features
+---
 
-- **Netflix-style Web UI** — beautiful poster view with metadata display
-- **HTTP Range Support** — seekable video playback with draggable progress bar
-- **Multi-Cloud Drive Download** — Alibaba Cloud Drive, Quark Pan, Baidu Netdisk, Tianyi Cloud, Xunlei Cloud
-- **External Search Integration** — Douban and TMDB metadata scraping
-- **Background Download Queue** — concurrent downloads with progress tracking
-- **Subscription Management** — episode tracking and season management
-- **Mobile Friendly** — responsive design with landscape playback support
+## 功能 | Features
 
-## Architecture
+- **Netflix 风格 UI** — 海报墙 + 元数据展示 Beautiful poster view with metadata
+- **HTTP Range 支持** — 可拖拽进度条的 seekable 播放 Seekable video playback
+- **多云盘下载 Multi-Cloud Download** — 阿里云盘、夸克网盘、百度网盘、天翼云盘、迅雷云盘 Alibaba/Quark/Baidu/Tianyi/Xunlei
+- **外部搜索 External Search** — 豆瓣 & TMDB 元数据刮取 Douban & TMDB metadata scraping
+- **后台下载队列 Background Queue** — 并发下载 + 进度追踪 Concurrent downloads with progress
+- **订阅管理 Subscription** — 剧集追踪与季管理 Episode tracking & season management
+- **移动端友好 Mobile Friendly** — 响应式设计 + 横屏播放 Responsive design with landscape playback
+
+## 架构 | Architecture
 
 ```
-streaming-server
-├── stream_server_v3.py      # Main HTTP server with range request support
-├── stream_server_v3_dl.py   # Download enhancement module
-├── cloud_download.py         # Multi-cloud drive download engine
-├── cloud_disk_dl.py          # Cloud disk download implementations
-├── pan_api.py                # Cloud storage API adapters
-├── router.py                 # URL routing and request handling
-├── database.py               # SQLite database for media metadata
-├── search_service.py         # Douban/TMDB external search
-├── space_manager.py          # Storage space management
-├── add_seasons.py            # Season/episode management
-└── templates/                # HTML templates
+streaming-server/
+├── stream_server_v3.py      # 主 HTTP 服务器（Range 请求）Main server
+├── stream_server_v3_dl.py   # 下载增强模块 Download enhancement
+├── cloud_download.py        # 多云盘下载引擎 Multi-cloud download engine
+├── cloud_disk_dl.py         # 云盘下载实现 Cloud disk implementations
+├── pan_api.py               # 云存储 API 适配器 Cloud storage API adapters
+├── router.py                # URL 路由 Routing
+├── database.py              # SQLite 媒体元数据库 Media metadata DB
+├── search_service.py        # 豆瓣/TMDB 搜索 External search
+├── space_manager.py         # 存储空间管理 Storage management
+├── add_seasons.py           # 季/集管理 Season/episode management
+└── templates/               # HTML 模板
 ```
 
-## Quick Start
-
-### Prerequisites
-- Python 3.9+
-- macOS or Linux
-
-### Installation
+## 快速启动 | Quick Start
 
 ```bash
-# Clone the repository
-git clone https://github.com/DrfterX/streaming-server.git
+git clone https://github.com/DrifterXXX/streaming-server.git
 cd streaming-server
-
-# Create videos directory
 mkdir -p videos
-
-# Start the server
 python3 stream_server_v3.py
 ```
 
-### Configuration
-
-Create a `.env` file (optional, for cloud drive features):
+### 云盘配置 | Cloud Drive Setup
 
 ```bash
-# Cloud drive credentials are stored in data/pan_creds.json
-# This file is automatically gitignored for security
+python3 pan_login.py          # 认证云盘账号 Authenticate
+# 凭据存储于 data/pan_creds.json（已 gitignore）Credentials stored locally
+python3 cloud_download.py     # 下载媒体 Download media
 ```
 
-### Cloud Drive Setup
+### 视频管理 | Video Management
 
-1. Run `python3 pan_login.py` to authenticate with supported cloud drives
-2. Credentials are stored locally in `data/pan_creds.json` (never committed to git)
-3. Use `python3 cloud_download.py` to download media from cloud drives
+- 将视频文件放入 `videos/` 目录 Place files in `videos/`
+- 支持格式 Formats: MP4, MKV, AVI, MOV, WEBM
+- 命名规范 Naming: `ShowName.ep01.mp4`
 
-### Video Management
+## 支持的云盘 | Supported Cloud Drives
 
-- Place video files in `videos/` directory
-- Supported formats: MP4, MKV, AVI, MOV, WEBM
-- Naming convention: `ShowName.ep01.mp4`, `ShowName.ep02.mp4`
+| 云盘 Provider | 状态 Status | 特性 Features |
+|---|---|---|
+| 阿里云盘 Alibaba Cloud Drive | ✅ | JWT 认证, 文件列表, 下载 |
+| 夸克网盘 Quark Pan | ✅ | Cookie 认证, 福利探索 |
+| 百度网盘 Baidu Netdisk | ✅ | BDUSS 认证, 文件列表 |
+| 天翼云盘 Tianyi Cloud | ✅ | Cookie 认证, 下载 |
+| 迅雷云盘 Xunlei Cloud | ✅ | Session 认证, 文件列表 |
 
-### Public Access (Optional)
+## 安全 | Security
 
-Use Cloudflare Tunnel to expose your server:
+所有云盘凭据仅存储在本地，绝不推送到 git。`data/`、`pan_creds.json`、`.env` 已通过 `.gitignore` 排除。
 
-```bash
-cloudflared tunnel --config ~/.cloudflared/config.yml run
-```
+All cloud drive credentials are stored locally and never pushed to git.
 
-## Supported Cloud Drives
+## 技术栈 | Tech Stack
 
-| Provider | Status | Features |
-|----------|--------|----------|
-| Alibaba Cloud Drive | ✅ | JWT auth, file listing, download |
-| Quark Pan | ✅ | Cookie auth, welfare explore |
-| Baidu Netdisk | ✅ | BDUSS auth, file listing |
-| Tianyi Cloud | ✅ | Cookie auth, download |
-| Xunlei Cloud | ✅ | Session auth, file listing |
+Python 3.9+ / SQLite / HTTP Range / 多线程下载 Multi-threaded downloads
 
-## Security
-
-- All cloud drive credentials are stored locally and never pushed to git
-- `data/`, `pan_creds.json`, `.env` are excluded via `.gitignore`
-- Review `pan_creds.json` before sharing your server directory
-
-## License
+## 许可证 | License
 
 MIT
